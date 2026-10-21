@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+*.egg-info/
+
+# This project's own runtime data (ChromaDB / SQLite stores created at
+# runtime are always in temp dirs via tempfile.TemporaryDirectory() in the
+# code as shipped -- these ignores are a safety net if that's changed to
+# point at a real path during development).
+chroma/
+*.db
+*.sqlite3
+results/
+
+# OS/editor noise
+.DS_Store
+*.swp
+.vscode/
+.idea/

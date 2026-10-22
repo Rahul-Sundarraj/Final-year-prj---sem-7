@@ -45,6 +45,42 @@ Module 2 -- Shared Memory directory
     Pass 2: 0 fresh LLM calls, 16 shared+cached, 0 shared-but-EVICTED
 ```
 
+## What combining all 4 modules actually saves
+
+The run above only checks that the wiring works. `unified_pipeline_experiment.py`
+answers the real question — replaying the SAME 10-question set (`pipeline.py`'s
+4 example questions + the 6 "easy"/"difficult" questions from Module 3's own
+`router.ipynb` test set, chosen because that notebook already showed they
+route differently) through the identical orchestration loop twice: once with
+Module 3's routing and Module 4's budgeting disabled (every stage forced to
+the large model, uncapped generation — i.e. Module 1 + Module 2 alone), and
+once with both enabled:
+
+```bash
+python3 unified_pipeline_experiment.py
+```
+
+```
+BASELINE (no routing, no budgeting)          FULL (Module 3 + Module 4)
+  total tokens: 11,350                         total tokens: 9,334
+                                                routing decisions: small=24, large=56
+Token saving from Module 3 + Module 4 (on top of Module 1+2): 17.8%
+```
+
+Both configurations hit the cache 100% of the time on pass 2 (Module 1+2's
+contribution is identical either way, by construction, since caching never
+depends on which model answers) — the 17.8% is specifically what Module 3's
+routing and Module 4's budgeting add **on top of** an already-working
+Module 1+2 pipeline, not a from-scratch no-memory-at-all comparison. Module 3
+made a genuine, non-degenerate split (24 of 80 stage-calls routed small, 56
+large), confirming the saving comes from real per-query routing decisions,
+not a constant one. As with the rest of this repo's MockBackend results, the
+token counts are real and reproducible but the *quality* of the generated
+text is not meaningfully evaluated — see Module 4's own real-Llama evaluation
+(26-74% savings depending on scale, cited in the thesis/report) for that side
+of the picture, and "Connecting real models" below to re-run this same
+comparison against a real backend.
+
 ## Architecture
 
 ```

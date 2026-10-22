@@ -31,6 +31,7 @@ EMBEDDING_MODEL = "allenai/longformer-base-4096"
 THRESHOLD = 0.5
 
 _STATE = {"router": None, "tokenizer": None, "embedder": None}
+_ROUTE_CACHE = {}  # (query, threshold) -> route() result, see route()'s docstring
 
 
 def configure(router_path, embedding_model=EMBEDDING_MODEL):
@@ -62,11 +63,25 @@ def embed_query(query: str) -> np.ndarray:
 
 def route(query: str, threshold: float = THRESHOLD) -> dict:
     """Returns {"decision": "small"|"large", "score": float in [0,1]}.
-    Higher score = the router is more confident the SMALL model suffices."""
+    Higher score = the router is more confident the SMALL model suffices.
+
+    Memoized by (query, threshold): hooks.select_model() is called with
+    the SAME raw question text for every pipeline stage and every pass
+    (by design -- Module 3 routes on the question itself, not a
+    stage-specific prompt), so a 4-stage, 2-pass pipeline would otherwise
+    recompute the identical Longformer embedding up to 8 times for the
+    same question. A real Longformer forward pass is deterministic given
+    identical input, so caching changes nothing about the decision --
+    it only removes genuinely redundant computation."""
+    cache_key = (query, threshold)
+    if cache_key in _ROUTE_CACHE:
+        return _ROUTE_CACHE[cache_key]
     if _STATE["router"] is None:
         raise RuntimeError("Call module3.configure(router_path) first")
     embedding = embed_query(query).reshape(1, -1)
     raw_score = _STATE["router"].predict(embedding)[0]
     score = float(np.clip(raw_score, 0, 1))
     decision = "small" if score >= threshold else "large"
-    return {"decision": decision, "score": score}
+    result = {"decision": decision, "score": score}
+    _ROUTE_CACHE[cache_key] = result
+    return result

@@ -37,11 +37,13 @@ def _reset_module3_and_module4_state():
     state -- these modules use module-level globals (the same pattern
     module4.py's own test_module4.py already relies on)."""
     module3._STATE.update(router=None, tokenizer=None, embedder=None)
+    module3._ROUTE_CACHE.clear()
     module4._BACKENDS.update(small=None, large=None)
     module4._STATE.update(model=None, margin=None)
     llm_backends._ROUTER_CONFIGURED = False
     yield
     module3._STATE.update(router=None, tokenizer=None, embedder=None)
+    module3._ROUTE_CACHE.clear()
     module4._BACKENDS.update(small=None, large=None)
     module4._STATE.update(model=None, margin=None)
     llm_backends._ROUTER_CONFIGURED = False

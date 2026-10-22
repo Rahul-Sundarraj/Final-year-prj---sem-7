@@ -21,16 +21,39 @@ runs the IDENTICAL question set, through the IDENTICAL orchestration loop
                isolates the routing+budgeting DECISION, not a difference
                in which text-generation backend was used).
 
-Both configurations replay the same 10-question set (4 from pipeline.py's
-own example questions + 6 from Module 3's own router.ipynb test set --
-3 "easy" conceptual questions, 3 "difficult" multi-step reasoning
-questions, chosen specifically because Module 3's own notebook already
-demonstrated they route differently), across 2 passes, with the same
-fixed Module 1 capacity.
+QUESTION SET: by default, the same 10-question small set as before. Pass
+`--pool-size N` to instead use the first N real benchmark queries from
+`small_query_bank.SMALL_QUERY_BANK_1000` (or `_FULL` if N > 1000) --
+matching this project's own established pool_size convention from Module
+1's experiments, rather than inventing a new one.
+
+CAPACITY IS DELIBERATELY KEPT FIXED regardless of pool size (not scaled
+proportionally) -- scaling capacity up with a much larger pool is what
+previously pushed a related experiment in this project into severe
+system memory pressure. A fixed capacity against a larger candidate pool
+is also how this project's own capacity-vs-pool-size experiments are
+run, so this isolates "bigger candidate pool, same memory" as the one
+new variable.
+
+A NOTE ON COST AT LARGE POOL SIZES: the semantic directory's TF-IDF
+re-fit is O(n) per lookup in how many questions have been recorded for
+that stage so far, so a full pass's total directory-lookup cost grows
+roughly QUADRATICALLY with pool size -- this is the dominant cost at
+large pool sizes when using MockBackend (near-instant) rather than real
+inference, not the LLM calls themselves. Module 3's real router adds a
+roughly CONSTANT ~0.5-1s per stage-call (a real Longformer forward pass),
+so its total cost grows only LINEARLY with pool size x stage count x
+passes. Run a small `--pool-size` first to measure real per-item timing
+on this machine before committing to a large run -- see the printed
+per-config wall-clock time and extrapolate from that, rather than
+guessing.
 
 RUN:
-    python3 unified_pipeline_experiment.py
+    python3 unified_pipeline_experiment.py                    # original 10-question set
+    python3 unified_pipeline_experiment.py --pool-size 100     # pilot run, measure timing
+    python3 unified_pipeline_experiment.py --pool-size 1000    # full-scale run
 """
+import argparse
 import time
 import tempfile
 from pathlib import Path
@@ -46,7 +69,7 @@ from example_agents import PIPELINE_STAGES
 from utils import compute_row_stats
 import pipeline as pipeline_mod
 
-QUESTIONS = [
+SMALL_QUESTION_SET = [
     # pipeline.py's own 4 example questions
     "What is the capital of France?",
     "What is 12 multiplied by 8?",
@@ -71,6 +94,19 @@ QUESTIONS = [
 SMALL_BACKEND_WORDS = 80   # MockBackend word budgets -- deliberately
 LARGE_BACKEND_WORDS = 260  # different, like Module 4's own 60/300 test split
 
+# Capacity kept FIXED regardless of pool size -- see module docstring.
+DEFAULT_TOTAL_CAPACITY = 78
+
+
+def build_questions(pool_size):
+    if pool_size is None:
+        return SMALL_QUESTION_SET
+    from small_query_bank import SMALL_QUERY_BANK_1000
+    if pool_size <= 1000:
+        return list(SMALL_QUERY_BANK_1000[:pool_size])
+    from small_query_bank import SMALL_QUERY_BANK_FULL
+    return list(SMALL_QUERY_BANK_FULL[:pool_size])
+
 
 def _baseline_call_llm(clients, provider, model, prompt, max_tokens=None):
     """No Module 3 routing (model is always forced to 'large' by
@@ -84,7 +120,8 @@ def _baseline_call_llm(clients, provider, model, prompt, max_tokens=None):
                cost=0.0, latency_s=0.0, provider=provider, model=f"baseline:{model}")
 
 
-def run_config(label, use_routing_and_budgeting, passes=2):
+def run_config(label, questions, use_routing_and_budgeting, passes=2,
+              capacities=None, progress_every=200):
     module4.configure(
         "module4_budget.joblib",
         small=module4.MockBackend("small", SMALL_BACKEND_WORDS),
@@ -102,7 +139,7 @@ def run_config(label, use_routing_and_budgeting, passes=2):
         call_llm = _baseline_call_llm
 
     directory = SemanticSharedMemoryDirectory()
-    caps = pipeline_mod.DEFAULT_CAPACITIES
+    caps = capacities or pipeline_mod.DEFAULT_CAPACITIES
     routing_counts = {"small": 0, "large": 0}
 
     with tempfile.TemporaryDirectory() as root:
@@ -121,9 +158,10 @@ def run_config(label, use_routing_and_budgeting, passes=2):
         t = 0
         wall0 = time.perf_counter()
         per_pass = []
+        n_done = 0
         for p in range(1, passes + 1):
             counts = dict(fresh=0, shared_cached=0, shared_evicted=0)
-            for question in QUESTIONS:
+            for question in questions:
                 context = {}
                 for stage_name, prompt_fn, context_key in PIPELINE_STAGES:
                     prompt = prompt_fn(snippet=question, **context)
@@ -144,22 +182,45 @@ def run_config(label, use_routing_and_budgeting, passes=2):
                         content = item.content
                     context[context_key] = content
                     t += 1
+                    n_done += 1
+                    if progress_every and n_done % progress_every == 0:
+                        elapsed = time.perf_counter() - wall0
+                        print(f"    [{label}] {n_done} stage-calls done, "
+                              f"{elapsed:.0f}s elapsed", flush=True)
             per_pass.append(counts)
         wall_elapsed = time.perf_counter() - wall0
 
     store_stats = compute_row_stats(store)
-    total_requests = passes * len(QUESTIONS) * len(PIPELINE_STAGES)
+    total_requests = passes * len(questions) * len(PIPELINE_STAGES)
     return dict(label=label, per_pass=per_pass, store_stats=store_stats,
                wall_elapsed=wall_elapsed, total_requests=total_requests,
-               routing_counts=routing_counts)
+               routing_counts=routing_counts, n_questions=len(questions))
 
 
 def main():
-    print(f"Question set: {len(QUESTIONS)} questions x {len(PIPELINE_STAGES)} "
-          f"stages x 2 passes = {len(QUESTIONS) * len(PIPELINE_STAGES) * 2} stage-requests\n")
+    parser = argparse.ArgumentParser(description="Combined 4-module baseline-vs-full comparison")
+    parser.add_argument("--pool-size", type=int, default=None,
+                        help="Use the first N real benchmark queries from "
+                             "small_query_bank instead of the default 10-question set.")
+    parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--progress-every", type=int, default=200,
+                        help="Print a progress line every N stage-calls (0 to disable).")
+    args = parser.parse_args()
 
-    baseline = run_config("BASELINE (no routing, no budgeting)", use_routing_and_budgeting=False)
-    full = run_config("FULL (Module 3 routing + Module 4 budgeting)", use_routing_and_budgeting=True)
+    questions = build_questions(args.pool_size)
+    caps = pipeline_mod.DEFAULT_CAPACITIES  # fixed regardless of pool size, by design
+
+    print(f"Question set: {len(questions)} questions x {len(PIPELINE_STAGES)} "
+          f"stages x {args.passes} passes = "
+          f"{len(questions) * len(PIPELINE_STAGES) * args.passes} stage-requests")
+    print(f"Capacity (fixed): {caps}\n")
+
+    baseline = run_config("BASELINE", questions, use_routing_and_budgeting=False,
+                          passes=args.passes, capacities=caps,
+                          progress_every=args.progress_every)
+    full = run_config("FULL", questions, use_routing_and_budgeting=True,
+                      passes=args.passes, capacities=caps,
+                      progress_every=args.progress_every)
 
     for result in (baseline, full):
         s = result["store_stats"]
@@ -183,6 +244,7 @@ def main():
     print("=" * 78)
     print("COMBINED RESULT")
     print("=" * 78)
+    print(f"  Questions: {len(questions)}, capacity: {caps}")
     print(f"  Baseline tokens: {base_tokens:.0f}")
     print(f"  Full (all 4 modules) tokens: {full_tokens:.0f}")
     print(f"  Token saving from Module 3 + Module 4 (on top of Module 1+2): {saved_pct:.1f}%")

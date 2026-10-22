@@ -81,6 +81,47 @@ text is not meaningfully evaluated — see Module 4's own real-Llama evaluation
 of the picture, and "Connecting real models" below to re-run this same
 comparison against a real backend.
 
+### Scaling to pool_size=1000 real benchmark queries
+
+`--pool-size N` replays the first N real queries from `small_query_bank.py`
+(the same `pool_size` convention Module 1's own experiments use) instead of
+the 10-question set, with capacity held fixed regardless of N — scaling
+capacity up with pool size is what previously pushed a related experiment in
+this project into severe system memory pressure:
+
+```bash
+python3 unified_pipeline_experiment.py --pool-size 1000
+```
+
+```
+BASELINE                                      FULL (Module 3 + Module 4)
+  total tokens: 2,162,000                       total tokens: 1,417,267
+                                                 routing decisions: small=4,624, large=3,376
+Token saving from Module 3 + Module 4 (on top of Module 1+2): 34.4%
+```
+
+The saving holds — and grows — at scale (17.8% at 10 questions, 30.1% at
+100, 34.4% at 1,000), with the routing split staying genuinely mixed rather
+than collapsing to one decision. At this pool size, fixed capacity starves
+hard (store hit rate 0.0% baseline / 1.1% full) — expected and consistent
+with this project's own capacity-vs-pool-size finding elsewhere, not a defect
+in this comparison.
+
+**A real performance fix, not just a bigger run**: `module3.py`'s `route()`
+is memoized by exact query text. `hooks.select_model()` calls it with the
+same raw question for all 4 pipeline stages and both passes by design, so
+without memoization a Longformer embedding (the expensive part, ~0.5-0.7s)
+would be recomputed up to 8 times per question. This cut the pool_size=1000
+run from a projected ~95 minutes to under 25 minutes for the FULL
+configuration (measured: 728s baseline, 1,469s full). Module 2's semantic
+(TF-IDF) directory lookup cost, by contrast, grows roughly quadratically with
+pool size and is NOT memoized the same way — pool_size=3000 with the semantic
+directory was estimated (from measured pool_size=100/1000 timings) at 20+
+hours and was not run; switching to the basic exact-match directory for that
+specific scale would avoid the quadratic cost, but changes what the
+comparison measures and was left for future work rather than silently
+substituted.
+
 ## Architecture
 
 ```

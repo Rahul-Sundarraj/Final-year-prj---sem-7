@@ -1,105 +1,54 @@
-# Module 4 integration template — Adaptive Token Budgeting
+# Module 4 — now integrated (this file used to be a template)
 
-## Where you plug in
+Module 4's real code arrived and is wired in: **`module4.py`** (the
+module exactly as delivered, unmodified) + **`module4_budget.joblib`**
+(trained for real on the project's `3.0 my_model_data_train.jsonl`, 6,443
+good answers / 3,944 unique queries — confirmed via Module 4's own
+`module4_wiring_check.py`, 18/18 PASS). `llm_backends.call_llm_module4()`
+calls it for real — see `README.md`'s architecture section and
+`llm_backends.py`'s own docstring for exactly how.
 
-`hooks.py`, one function:
-
-```python
-def select_token_budget(stage_name: str, question: str) -> "int | None":
-    return None
-```
-
-`pipeline.py` calls this once per pipeline stage per question, right
-after `select_model()` (Module 3's hook) and before the Module 2 lookup.
-Whatever you return is threaded all the way through to the real LLM call
-— **this has already been verified to work**, not just plumbed:
+## What it actually does
 
 ```python
-# Verified against real Ollama inference:
-#   uncapped call  -> 256 output tokens
-#   max_tokens=15  -> exactly 15 output tokens
+import module4
+module4.configure("module4_budget.joblib",
+                  small=module4.MockBackend("small", 60),   # swap for a real backend
+                  large=module4.MockBackend("large", 300))  # when ready -- see below
+result = module4.run(query, model_choice)   # model_choice: "small" or "large"
+                                             # (this is Module 3's decision)
+print(result["final_answer"])
 ```
 
-## The contract
+One call predicts a token budget *and* generates the final answer *and*
+handles a cut-off answer safely (continues once if the backend supports
+it, otherwise falls back to an uncapped answer) — see `module4.py`'s own
+docstring and `MODULE4_ORIGINAL_DOCS.md` for the full original
+integration note, including the real-Llama behavior table (26-51% fewer
+tokens on in-distribution questions; known weaker budgets on free-form
+questions outside the 14 trained task types).
 
-- **Input**: `stage_name` and `question`, same as Module 3's hook (see
-  `MODULE3_TEMPLATE.md` if you need the full prompt text instead of just
-  the question).
-- **Output**: an `int` token ceiling, or `None` for "no explicit cap, use
-  the model's own default" — this is the behavior before Module 4 exists,
-  so returning `None` for everything is always a safe, inert default.
-- **Only consulted when a real LLM call actually happens** — a Module 2
-  cache hit never calls the LLM, so it never needs a token budget; you
-  don't need to special-case that.
-- **Model-specific**: your own findings show the small-model and
-  large-model regressors predict *different* budgets for the same query.
-  Since Module 3's `select_model()` is called first (same stage, same
-  question), you can condition your budget prediction on which model
-  Module 3 picked, by calling `hooks.select_model(stage_name, question)`
-  again inside `select_token_budget()` (cheap — it's not an LLM call) or,
-  cleaner, by refactoring `run_stage()` in `pipeline.py` to call
-  `select_model()` once and pass the result into `select_token_budget()`.
-
-## How it actually reaches the LLM call (for reference, you shouldn't need to touch this)
-
-```
-hooks.select_token_budget(stage, question)
-        |
-pipeline.py's run_stage()
-        |
-memory_store.py's store.add() / store.access(max_tokens=...)
-        |
-local_ollama_llm.py's call_llm(..., max_tokens=...)
-        |
-Ollama's options={"num_predict": max_tokens}
-```
-
-If your team swaps in a different LLM provider later (not Ollama), that
-provider's own `call_llm`-shaped function needs to accept `max_tokens=None`
-too and map it to whatever that API calls its max-output-tokens parameter
-(e.g. OpenAI's `max_tokens`, Anthropic's `max_tokens`) — this is the one
-place token budgeting is provider-specific.
-
-## Worked example
-
-Based on your own Module 4 findings (two regressors, by task type):
+## Connecting real models (currently MockBackend for both)
 
 ```python
-import joblib
+import module4
+small = module4.HFBackend("meta-llama/Llama-3.1-8B-Instruct", hf_token=TOKEN)
+large = module4.OpenAIChatBackend("<your 49B model>", "<base url>/v1", "<api key>")
+```
+Pass these as `module4_small=`/`module4_large=` to `pipeline.run_demo(...,
+llm="module34", ...)`. Test the large/49B path specifically before
+relying on it — per Module 4's own docs, it was **not** run against a
+real model during Module 4's own testing, only `MockBackend`.
 
-_small_model_budget = joblib.load("module4_small_regressor.joblib")
-_large_model_budget = joblib.load("module4_large_regressor.joblib")
+## Retraining the budget model
 
-TASK_TYPES = ["arithmetic", "factual", "code", "open_ended", "multi_part"]
-
-def _classify_task_type(question: str) -> str:
-    # Your actual task-type classifier -- illustrative placeholder here.
-    ...
-
-def select_token_budget(stage_name: str, question: str) -> "int | None":
-    provider, model = select_model(stage_name, question)  # ask Module 3 too
-    task_type = _classify_task_type(question)
-    regressor = _small_model_budget if model == DEFAULT_MODEL else _large_model_budget
-    predicted = regressor.predict([[TASK_TYPES.index(task_type)]])[0]
-    return max(1, round(predicted))   # Ollama's num_predict wants a positive int
+```bash
+python3 train_module4.py path/to/training_data.jsonl module4_budget.joblib
 ```
 
-## Testing your integration
+## Known limitation (noted in README too)
 
-1. Sanity-check `select_token_budget()` in isolation first, same as
-   Module 3 — a handful of example questions, confirm the returned budgets
-   look reasonable for their task type.
-2. `python3 pipeline.py --mock` — the offline mock LLM (`memory_store.
-   default_mock_call_llm`) **honors `max_tokens` too** (it caps its
-   simulated output token count), so you can confirm your budgeting logic
-   changes the reported token totals even without real inference.
-3. `python3 pipeline.py` for real, and compare total tokens against a run
-   with `select_token_budget()` temporarily reverted to always return
-   `None` — that delta is your module's actual, measured saving, the same
-   way your own evaluation measured 69-74% average savings across three
-   scales.
-4. Spot-check a few real answers for truncation/quality loss, the same way
-   your own 4-query and multi-domain tests did (comparing quality scores,
-   not just token counts) — a smaller budget that silently cuts off a
-   correct answer mid-sentence is a regression even if the token count
-   looks good.
+Module 4's backends were tested against Llama 3.1 8B / Llama 3.3 Nemotron
+49B — a different pair than Module 3's own Gemini-based routing demo. See
+`MODULE3_TEMPLATE.md`'s matching note and `llm_backends.py`'s module
+docstring.

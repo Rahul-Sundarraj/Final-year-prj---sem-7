@@ -1,5 +1,19 @@
+# Core -- Module 1 + Module 2, needed everywhere
 chromadb
 scikit-learn
 numpy
-ollama
 pytest
+
+# Module 1+2's Ollama fallback path (--llm ollama)
+ollama
+
+# Module 3's router (embedding + the trained MLPRegressor) and
+# Module 4's budget model
+torch
+transformers
+pandas
+joblib
+
+# Only if you connect Module 4 to a real OpenAI-compatible API
+# (module4.OpenAIChatBackend)
+requests

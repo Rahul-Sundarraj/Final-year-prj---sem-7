@@ -1,90 +1,46 @@
-# Module 3 integration template — LLM Routing
+# Module 3 — now integrated (this file used to be a template)
 
-## Where you plug in
+Module 3's real code arrived and is wired in: **`module3.py`** +
+**`my_hybrid_trained.pkl`** (the trained router, extracted and cleaned up
+from the team's `router.ipynb`). `hooks.select_model()` calls it for real
+— see `README.md`'s architecture section and `hooks.py`'s own docstring
+for exactly how.
 
-`hooks.py`, one function:
-
-```python
-def select_model(stage_name: str, question: str) -> tuple[str, str]:
-    return DEFAULT_PROVIDER, DEFAULT_MODEL
-```
-
-That's it. `pipeline.py` calls this once per pipeline stage per question,
-*before* Module 2's shared-memory lookup, and uses whatever `(provider,
-model)` you return if a fresh LLM call turns out to be necessary.
-
-## The contract
-
-- **Input**: `stage_name` (e.g. `"extractor"`, `"analyzer"`, `"writer"`,
-  `"reviewer"` — whatever your `example_agents.py`/your own agents module
-  defines in `PIPELINE_STAGES`) and `question` (the raw input text for
-  this stage — note this is the *question*, not the full prompt built
-  from it; if your router needs the full prompt text instead, see "If you
-  need the full prompt" below).
-- **Output**: a `(provider, model)` tuple. `provider` is a key into the
-  `clients` dict passed to `RealCostAwareMemoryStore` (see
-  `local_ollama_llm.LOCAL_CLIENTS` — currently just `{"ollama": ollama}`).
-  `model` is whatever model string that provider's `call_llm` expects
-  (e.g. `"llama3.2:1b"`, `"phi3:mini"`).
-- **Called on every stage**, even when the result turns out not to be
-  needed (a Module 2 cache hit means the model you picked is never
-  actually invoked) — so keep this cheap. A trained classifier/regressor
-  inference call is fine; don't do anything that itself calls an LLM.
-
-## Worked example
-
-Say your router is a trained classifier that predicts "easy" vs. "hard"
-from a handful of cheap features (question length, presence of certain
-keywords, etc.), and you've decided "easy" goes to a small model, "hard"
-goes to a larger one:
+## What it actually does
 
 ```python
-import joblib
-
-_router = joblib.load("module3_router.joblib")   # your trained classifier
-SMALL_MODEL = ("ollama", "llama3.2:1b")
-LARGE_MODEL = ("ollama", "phi3:mini")
-
-def _features(stage_name, question):
-    # Whatever your actual router was trained on -- this is illustrative.
-    return [[len(question), question.count("?"), stage_name == "writer"]]
-
-def select_model(stage_name: str, question: str) -> tuple[str, str]:
-    is_hard = _router.predict(_features(stage_name, question))[0]
-    return LARGE_MODEL if is_hard else SMALL_MODEL
+import module3
+module3.configure("my_hybrid_trained.pkl")   # once, downloads Longformer
+                                              # from HF the first time
+result = module3.route("some question")
+# {"decision": "small" or "large", "score": float in [0, 1]}
 ```
 
-If you have more than two models/tiers, just return the right tuple for
-whichever tier your router picked — `pipeline.py` doesn't assume there are
-only two.
+A Longformer embedding (mean-pooled over `last_hidden_state`) of the query
+goes into a trained `MLPRegressor`; score ≥ 0.5 → `"small"`, else
+`"large"`. No keyword rules.
 
-## If you need the full prompt, not just the question
+## If you want to change the router itself
 
-Right now `select_model()` only receives `question` (the raw input text),
-not the full stage prompt (which includes prior stages' outputs as
-context — see `example_agents.py`'s `analyzer_prompt`/`writer_prompt`/
-`reviewer_prompt`). If your router's features genuinely need the full
-prompt text:
+- **Retrain it**: that's Module 3's own notebook (`router.ipynb`'s
+  training cells, not included in this repo — ask Module 3's owner for
+  the training pipeline if you need to retrain on new data). Drop the new
+  `.pkl` in and point `configure()` at it — nothing else changes.
+- **Change the decision threshold**: `module3.route(query, threshold=0.6)`
+  — see `module3.py`.
+- **Feed it the full prompt instead of just the question**: `route()`
+  currently takes whatever text `hooks.select_model()` passes it (the raw
+  `question`, not the full stage prompt with prior-stage context — see
+  `example_agents.py`). If your router needs the fuller prompt text,
+  change `hooks.select_model()`'s call to `module3.route(prompt)` and
+  thread `prompt` through from `pipeline.py`'s `run_stage()` the same way
+  `llm_backends.py`'s docstring describes for Module 4.
 
-1. Change `select_model`'s signature to also accept `prompt: str`.
-2. In `pipeline.py`'s `run_stage()`, the prompt is already built (the
-   `prompt` parameter) *before* `select_model()` is called — just pass it
-   through: `hooks.select_model(stage_name, question, prompt)`.
+## Known limitation (noted in README too)
 
-This is a one-line change in exactly one place (`run_stage()`); nothing
-else depends on the hook's exact signature.
-
-## Testing your integration
-
-1. First, sanity-check your router in isolation — call `select_model()`
-   directly with a few example `(stage_name, question)` pairs and confirm
-   it returns what you expect, before wiring it into the pipeline.
-2. Run `python3 pipeline.py --mock` — this exercises the full pipeline
-   (including your router) with zero LLM cost, so you can confirm nothing
-   crashes and the routing decisions look sane in the printed trace
-   (`t=... q... stage_name [...] preview`).
-3. Run `python3 pipeline.py` for real and compare total tokens/cost against
-   a run with `select_model()` temporarily reverted to always return the
-   large model — that delta is your routing module's actual, measured
-   saving, the same way Module 3's own CrewAI evaluation measured a 31.6%
-   cost reduction.
+Module 3's own demo routed between Gemini 2.5 Flash / Gemini 3.6 Flash —
+a different small/large pair than Module 4's own tested backends (Llama
+3.1 8B / Llama 3.3 Nemotron 49B). The router's *decision* ("small" vs.
+"large") is model-agnostic and works fine either way, but the team needs
+to consciously choose one real small/large pair for final deployment —
+see `llm_backends.py`'s module docstring.

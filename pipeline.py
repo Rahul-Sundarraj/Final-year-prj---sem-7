@@ -1,29 +1,39 @@
 """
 pipeline.py
 
-The combined Module 1 (cost-aware memory eviction) + Module 2 (shared /
-transactive memory, semantic matching) orchestration pipeline, with two
-explicit integration points for Module 3 (LLM routing) and Module 4
-(adaptive token budgeting) -- see hooks.py. This file is the one place
-those two modules plug into; nothing else in this repo needs to change
-when you wire them in.
+The unified Module 1 + 2 + 3 + 4 orchestration pipeline:
+
+    Module 1 (memory_store.py)       -- cost-aware tiered memory eviction
+    Module 2 (semantic_directory.py) -- shared / transactive memory
+    Module 3 (module3.py)            -- trained query-complexity router
+    Module 4 (module4.py)            -- adaptive token budget + generation
+
+hooks.py is the integration surface between Module 1+2 (the orchestration
+loop below) and Module 3+4 -- see that file's docstring for the exact
+contract. llm_backends.py is where Module 3's routing decision and
+Module 4's budgeting/generation actually get wired into Module 1's single
+`call_llm_fn` slot.
 
 PER-STAGE FLOW (run_stage(), below):
 
     1. hooks.select_model(stage, question)         <- MODULE 3
-    2. hooks.select_token_budget(stage, question)   <- MODULE 4
+    2. hooks.select_token_budget(stage, question)   <- MODULE 4 (always
+       None in the real 4-module path -- see hooks.py's docstring)
     3. Module 2 lookup: "has any agent already answered this?"
        -> HIT:  Module 1 access() -- real cache hit, or a stale "shared but
                 evicted" miss if Module 1 had already thrown it away.
-       -> MISS: Module 1 add() -- a real LLM call, using the model Module 3
-                picked and the token budget Module 4 picked, then record()
-                the question in Module 2's directory for future reuse.
+       -> MISS: Module 1 add() -- a real LLM call (Module 3's chosen model,
+                Module 4's chosen budget, both via llm_backends.py), then
+                record() the question in Module 2's directory for reuse.
 
 RUN:
-    python3 pipeline.py --mock              # instant, offline wiring check
-    python3 pipeline.py                     # real Ollama inference
-    python3 pipeline.py --baseline          # basic exact-match Module 2
-                                             # instead of semantic matching
+    python3 pipeline.py --llm mock               # instant, offline wiring check
+    python3 pipeline.py --llm ollama             # real Ollama, Module 1+2 only
+    python3 pipeline.py --llm module34           # full 4-module pipeline
+                                                  # (Module 4 uses MockBackend
+                                                  # text generation by default)
+    python3 pipeline.py --baseline               # basic exact-match Module 2
+                                                  # instead of semantic matching
 """
 
 import argparse
@@ -113,7 +123,9 @@ def run_pipeline_once(store, directory, questions, t0, verbose=True):
     return t, counts, semantic_hit_records
 
 
-def run_demo(questions, passes=2, verbose=True, mock=False, baseline=False, capacities=None):
+def run_demo(questions, passes=2, verbose=True, llm="mock", baseline=False, capacities=None,
+            router_path="my_hybrid_trained.pkl", module4_budget_path="module4_budget.joblib",
+            module4_small=None, module4_large=None):
     """Runs the full pipeline and returns a stats dict.
 
     `questions`: list of question/input strings to replay, `passes` times
@@ -124,12 +136,43 @@ def run_demo(questions, passes=2, verbose=True, mock=False, baseline=False, capa
     `capacities`: override DEFAULT_CAPACITIES (active/vector/cold dict from
         utils.split_capacity()) -- see the module docstring's warning about
         NOT scaling this proportionally to a much larger question set.
+
+    `llm` selects which generation path hooks.select_model() + this run
+    actually use -- three options:
+        "mock"     -- fully offline, no Module 3/4 involved at all. Same
+                     as the original Module 1+2-only wiring check.
+        "ollama"   -- real local Ollama inference, still no Module 3/4 --
+                     Module 1+2 only, same as before Module 3/4 existed.
+        "module34" -- the real, full 4-module pipeline: Module 3's trained
+                     router (needs the Longformer download the first time,
+                     and `router_path`) decides small/large, Module 4
+                     (needs `module4_budget_path`) predicts a token budget
+                     and generates the answer. `module4_small`/
+                     `module4_large` are module4 backend objects (default:
+                     module4.MockBackend() for both -- safe, no GPU/API key
+                     needed; pass real module4.HFBackend(...) /
+                     module4.OpenAIChatBackend(...) instances to use real
+                     models -- see MODULE3_TEMPLATE.md / MODULE4_TEMPLATE.md).
     """
-    if mock:
+    if llm == "mock":
         from memory_store import default_mock_call_llm as call_llm
         LOCAL_CLIENTS = {"ollama": None}
-    else:
+    elif llm == "ollama":
         from local_ollama_llm import call_llm, LOCAL_CLIENTS
+    elif llm == "module34":
+        import module4
+        import llm_backends
+        if not llm_backends.router_is_configured():
+            llm_backends.configure_router(router_path)
+        llm_backends.configure_module4(
+            module4_budget_path,
+            small=module4_small or module4.MockBackend("small", 60),
+            large=module4_large or module4.MockBackend("large", 300),
+        )
+        call_llm = llm_backends.unified_call_llm
+        LOCAL_CLIENTS = {"module4": None}
+    else:
+        raise ValueError(f"Unknown llm={llm!r} -- use 'mock', 'ollama', or 'module34'")
 
     caps = capacities or DEFAULT_CAPACITIES
     directory = ExactMatchDirectory() if baseline else SemanticSharedMemoryDirectory()
@@ -211,13 +254,22 @@ def print_report(result):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Module 1 + Module 2 orchestration pipeline")
+    parser = argparse.ArgumentParser(description="Module 1 + 2 + 3 + 4 unified pipeline")
     parser.add_argument("--passes", type=int, default=2)
-    parser.add_argument("--mock", action="store_true",
-                        help="Use the offline mock LLM instead of Ollama (instant; good "
-                             "for checking wiring before spending real inference time)")
+    parser.add_argument("--llm", choices=["mock", "ollama", "module34"], default="mock",
+                        help="'mock': fully offline Module 1+2 wiring check (default). "
+                             "'ollama': real local Ollama inference, Module 1+2 only. "
+                             "'module34': the full 4-module pipeline -- Module 3's real "
+                             "trained router + Module 4's budgeting/generation (MockBackend "
+                             "text generation by default -- see MODULE3_TEMPLATE.md / "
+                             "MODULE4_TEMPLATE.md to plug in real models).")
     parser.add_argument("--baseline", action="store_true",
                         help="Use the basic exact-match Module 2 instead of semantic matching")
+    parser.add_argument("--router-path", default="my_hybrid_trained.pkl",
+                        help="Module 3's trained router (only used with --llm module34)")
+    parser.add_argument("--module4-budget-path", default="module4_budget.joblib",
+                        help="Module 4's trained budget model (only used with --llm module34; "
+                             "run train_module4.py first if this doesn't exist yet)")
     args = parser.parse_args()
 
     # Replace this with your own question list, or import from a dataset
@@ -231,7 +283,9 @@ def main():
     ]
 
     result = run_demo(questions, passes=args.passes, verbose=True,
-                      mock=args.mock, baseline=args.baseline)
+                      llm=args.llm, baseline=args.baseline,
+                      router_path=args.router_path,
+                      module4_budget_path=args.module4_budget_path)
     print_report(result)
 
 

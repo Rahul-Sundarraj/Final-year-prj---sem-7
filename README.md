@@ -61,7 +61,7 @@ python3 unified_pipeline_experiment.py
 ```
 
 ```
-BASELINE (no routing, no budgeting)          FULL (Module 3 + Module 4)
+BASELINE (Module 1+2 only)                   FULL (Module 1+2+3+4)
   total tokens: 11,350                         total tokens: 9,334
                                                 routing decisions: small=24, large=56
 Token saving from Module 3 + Module 4 (on top of Module 1+2): 17.8%
@@ -94,7 +94,7 @@ python3 unified_pipeline_experiment.py --pool-size 1000
 ```
 
 ```
-BASELINE                                      FULL (Module 3 + Module 4)
+BASELINE (Module 1+2 only)                    FULL (Module 1+2+3+4)
   total tokens: 2,162,000                       total tokens: 1,417,267
                                                  routing decisions: small=4,624, large=3,376
 Token saving from Module 3 + Module 4 (on top of Module 1+2): 34.4%

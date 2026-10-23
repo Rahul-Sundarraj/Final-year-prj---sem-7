@@ -5,21 +5,24 @@ The actual "what do you get from combining all four modules" experiment --
 runs the IDENTICAL question set, through the IDENTICAL orchestration loop
 (pipeline.py), in two configurations that differ in only one respect:
 
-    BASELINE : no Module 3 routing (every stage forced to the "large"
-               model), no Module 4 budgeting (every generation uncapped,
-               via the same backend's own normal/full-length output).
-               Module 1 + Module 2 (caching/eviction) still active --
-               this isolates what Module 3 + Module 4 add ON TOP of an
-               already-working Module 1+2 pipeline, not a from-scratch
+    BASELINE (Module 1+2 only) : no Module 3 routing (every stage forced
+               to the "large" model), no Module 4 budgeting (every
+               generation uncapped, via the same backend's own normal/
+               full-length output). Module 1 + Module 2 (caching/eviction)
+               ARE active here too -- this is not a from-scratch,
                no-memory-at-all baseline (that comparison already exists,
-               see Module 2's own README section).
+               see Module 2's own README section). It isolates what
+               Module 3 + Module 4 add ON TOP of an already-working
+               Module 1+2 pipeline.
 
-    FULL     : Module 3's real trained router decides small/large per
-               stage; Module 4 predicts a token budget for that choice
-               and generates the answer with it (MockBackend text
-               generation in both configurations, so the comparison
-               isolates the routing+budgeting DECISION, not a difference
-               in which text-generation backend was used).
+    FULL (Module 1+2+3+4) : all four modules together -- Module 1+2's
+               caching/eviction exactly as in the baseline, PLUS Module
+               3's real trained router deciding small/large per stage and
+               Module 4 predicting a token budget for that choice and
+               generating the answer with it (MockBackend text generation
+               in both configurations, so the comparison isolates the
+               routing+budgeting DECISION, not a difference in which
+               text-generation backend was used).
 
 QUESTION SET: by default, the same 10-question small set as before. Pass
 `--pool-size N` to instead use the first N real benchmark queries from
@@ -215,10 +218,17 @@ def main():
           f"{len(questions) * len(PIPELINE_STAGES) * args.passes} stage-requests")
     print(f"Capacity (fixed): {caps}\n")
 
-    baseline = run_config("BASELINE", questions, use_routing_and_budgeting=False,
+    # Labels spell out what's actually active in each configuration --
+    # "BASELINE" is NOT "no modules", it's Module 1+2 alone (caching and
+    # eviction are on in both configurations; only routing/budgeting
+    # differ), and "FULL" is all four modules together, not just "3+4"
+    # added to nothing.
+    baseline = run_config("BASELINE (Module 1+2 only)", questions,
+                          use_routing_and_budgeting=False,
                           passes=args.passes, capacities=caps,
                           progress_every=args.progress_every)
-    full = run_config("FULL", questions, use_routing_and_budgeting=True,
+    full = run_config("FULL (Module 1+2+3+4)", questions,
+                      use_routing_and_budgeting=True,
                       passes=args.passes, capacities=caps,
                       progress_every=args.progress_every)
 

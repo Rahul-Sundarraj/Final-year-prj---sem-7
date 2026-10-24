@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Multi-Agent LLM Framework — Demo</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --border: #2a2e3a; --text: #e6e8ee;
+    --muted: #9099ab; --accent: #5b8cff; --small: #3ddc97; --large: #ff9f5b;
+    --ok: #3ddc97; --miss: #ff9f5b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 24px 32px 60px;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: 0.9rem; }
+  .input-row { display: flex; gap: 10px; margin-bottom: 8px; }
+  input[type=text] {
+    flex: 1; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 1rem;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); }
+  button {
+    padding: 12px 22px; border-radius: 8px; border: none; background: var(--accent);
+    color: white; font-size: 1rem; cursor: pointer; font-weight: 600;
+  }
+  button:disabled { background: #3a3f52; cursor: wait; }
+  .examples { color: var(--muted); font-size: 0.85rem; margin-bottom: 28px; }
+  .examples a { color: var(--accent); cursor: pointer; text-decoration: none; margin-right: 14px; }
+  .examples a:hover { text-decoration: underline; }
+  #status { color: var(--muted); font-size: 0.9rem; min-height: 1.2em; margin-bottom: 16px; }
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px;
+  }
+  .panel h2 { font-size: 1.05rem; margin: 0 0 2px; }
+  .panel .tag {
+    display: inline-block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em;
+    padding: 2px 8px; border-radius: 5px; margin-bottom: 14px; text-transform: uppercase;
+  }
+  .tag.baseline { background: #3a3f52; color: var(--muted); }
+  .tag.full { background: #1f3a2e; color: var(--small); }
+  .pass-label { color: var(--muted); font-size: 0.78rem; margin: 14px 0 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .stage {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+    background: #12141c;
+  }
+  .stage-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .stage-name { font-weight: 600; text-transform: capitalize; }
+  .pill { font-size: 0.72rem; padding: 2px 7px; border-radius: 12px; font-weight: 600; }
+  .pill.small { background: #15372a; color: var(--small); }
+  .pill.large { background: #3a2515; color: var(--large); }
+  .pill.cache { background: #223; color: #9bb; }
+  .pill.fresh { background: #332a15; color: #e0b84e; }
+  .stage-meta { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+  .stage-content {
+    margin-top: 6px; font-size: 0.85rem; color: #c8ccd8; max-height: 4.4em; overflow: hidden;
+    line-height: 1.4;
+  }
+  .totals { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 0.95rem; }
+  .totals .num { font-weight: 700; font-size: 1.3rem; }
+  .result-banner {
+    margin-top: 24px; padding: 18px 22px; border-radius: 12px; background: linear-gradient(90deg, #15372a, #1a2234);
+    border: 1px solid #1f3a2e; font-size: 1.1rem; text-align: center; display: none;
+  }
+  .result-banner .pct { font-size: 1.8rem; font-weight: 800; color: var(--small); }
+  .error { color: #ff6b6b; }
+</style>
+</head>
+<body>
+
+  <h1>Multi-Agent LLM Framework — Live Demo</h1>
+  <p class="sub">
+    Combined Module 1 (cost-aware eviction) + Module 2 (shared memory) + Module 3 (trained
+    router) + Module 4 (adaptive budgeting). Every stage below is a real call into the actual
+    trained models — not a canned mock of the UI.
+  </p>
+
+  <div class="input-row">
+    <input type="text" id="question" placeholder="Type a question, e.g. 'What is 12 multiplied by 8?'" />
+    <button id="runBtn" onclick="run()">Run</button>
+  </div>
+  <div class="examples">
+    Try:
+    <a onclick="fill('What is the capital of France?')">What is the capital of France?</a>
+    <a onclick="fill('Explain how a Transformer uses self-attention to model relationships between tokens, and derive the scaled dot-product attention equation.')">A hard reasoning question</a>
+    <a onclick="fill('What is a binary search tree?')">A medium question</a>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="columns" id="columns" style="display:none;">
+    <div class="panel">
+      <span class="tag baseline">Baseline</span>
+      <h2>Orchestrator + one common LLM</h2>
+      <div id="baseline-body"></div>
+      <div class="totals">Total tokens: <span class="num" id="baseline-total">—</span></div>
+    </div>
+    <div class="panel">
+      <span class="tag full">Full</span>
+      <h2>Module 1 + 2 + 3 + 4</h2>
+      <div id="full-body"></div>
+      <div class="totals">Total tokens: <span class="num" id="full-total">—</span></div>
+    </div>
+  </div>
+
+  <div class="result-banner" id="banner">
+    Token saving from adding Module 1+2+3+4 on top of the plain orchestrator:
+    <span class="pct" id="banner-pct">—</span>
+  </div>
+
+<script>
+function fill(text) { document.getElementById('question').value = text; }
+
+function stageHtml(s) {
+  let modelPill;
+  if (s.model === 'small') {
+    modelPill = '<span class="pill small">small' + (s.score != null ? ' · ' + s.score.toFixed(2) : '') + '</span>';
+  } else if (s.model === 'large') {
+    modelPill = '<span class="pill large">large' + (s.score != null ? ' · ' + s.score.toFixed(2) : '') + '</span>';
+  } else {
+    modelPill = '<span class="pill cache">common LLM</span>';
+  }
+  const cachePill = s.cache_status === 'fresh'
+    ? '<span class="pill fresh">fresh LLM call</span>'
+    : '<span class="pill cache">' + s.cache_status.replace('-', ' ') + '</span>';
+  return `
+    <div class="stage">
+      <div class="stage-head">
+        <span class="stage-name">${s.stage}</span>
+        ${modelPill}
+      </div>
+      <div class="stage-meta">${cachePill} &nbsp;·&nbsp; ${s.tokens} tokens</div>
+      <div class="stage-content">${escapeHtml(s.content)}</div>
+    </div>`;
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+function renderSide(bodyId, totalId, data) {
+  let html = '<div class="pass-label">Pass 1 — fresh</div>';
+  html += data.pass1.map(stageHtml).join('');
+  html += '<div class="pass-label">Pass 2 — same question again</div>';
+  html += data.pass2.map(stageHtml).join('');
+  document.getElementById(bodyId).innerHTML = html;
+  document.getElementById(totalId).textContent = data.total_tokens.toLocaleString();
+}
+
+async function run() {
+  const question = document.getElementById('question').value.trim();
+  const status = document.getElementById('status');
+  const btn = document.getElementById('runBtn');
+  if (!question) { status.innerHTML = '<span class="error">Type a question first.</span>'; return; }
+
+  btn.disabled = true;
+  status.textContent = 'Running through the pipeline (first run downloads/loads the router model, may take a few seconds)…';
+  document.getElementById('columns').style.display = 'none';
+  document.getElementById('banner').style.display = 'none';
+
+  try {
+    const res = await fetch('/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+
+    renderSide('baseline-body', 'baseline-total', data.baseline);
+    renderSide('full-body', 'full-total', data.full);
+    document.getElementById('columns').style.display = 'grid';
+
+    document.getElementById('banner-pct').textContent = data.saved_pct + '%';
+    document.getElementById('banner').style.display = 'block';
+    status.textContent = '';
+  } catch (e) {
+    status.innerHTML = '<span class="error">' + e.message + '</span>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('question').addEventListener('keydown', e => {
+  if (e.key === 'Enter') run();
+});
+</script>
+</body>
+</html>

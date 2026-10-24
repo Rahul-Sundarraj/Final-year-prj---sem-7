@@ -51,29 +51,44 @@ The run above only checks that the wiring works. `unified_pipeline_experiment.py
 answers the real question — replaying the SAME 10-question set (`pipeline.py`'s
 4 example questions + the 6 "easy"/"difficult" questions from Module 3's own
 `router.ipynb` test set, chosen because that notebook already showed they
-route differently) through the identical orchestration loop twice: once with
-Module 3's routing and Module 4's budgeting disabled (every stage forced to
-the large model, uncapped generation — i.e. Module 1 + Module 2 alone), and
-once with both enabled:
+route differently) through the identical orchestration loop across **four**
+configurations that turn Module 1+2 (caching/eviction) and Module 3+4
+(routing/budgeting) on or off independently, then compares three pairs —
+each isolating what a *different* starting point gains from reaching the
+same FULL (all four modules) endpoint:
 
 ```bash
 python3 unified_pipeline_experiment.py
 ```
 
 ```
-BASELINE (Module 1+2 only)                   FULL (Module 1+2+3+4)
-  total tokens: 11,350                         total tokens: 9,334
-                                                routing decisions: small=24, large=56
-Token saving from Module 3 + Module 4 (on top of Module 1+2): 17.8%
+MODULE 1+2 ONLY   (caching on,  routing/budgeting off): 11,350 tokens
+MODULE 3+4 ONLY   (caching off, routing/budgeting on) : 17,780 tokens
+TRUE ZERO MODULES (plain orchestrator, one common LLM): 21,620 tokens
+FULL (Module 1+2+3+4)                                 :  9,334 tokens
+
+TEST 1: MODULE 1+2 ONLY   -> FULL : 17.8% saved  (what Module 3+4 add on top of Module 1+2)
+TEST 2: MODULE 3+4 ONLY   -> FULL : 47.5% saved  (what Module 1+2's caching adds on top of Module 3+4)
+TEST 3: TRUE ZERO MODULES -> FULL : 56.8% saved  (all four modules vs. no modules at all)
 ```
 
-Both configurations hit the cache 100% of the time on pass 2 (Module 1+2's
-contribution is identical either way, by construction, since caching never
-depends on which model answers) — the 17.8% is specifically what Module 3's
-routing and Module 4's budgeting add **on top of** an already-working
-Module 1+2 pipeline, not a from-scratch no-memory-at-all comparison. Module 3
-made a genuine, non-degenerate split (24 of 80 stage-calls routed small, 56
-large), confirming the saving comes from real per-query routing decisions,
+- **MODULE 1+2 ONLY**: Module 1's eviction + Module 2's shared-memory cache
+  are active; every stage is forced to the large model with uncapped
+  generation (no routing, no budgeting).
+- **MODULE 3+4 ONLY**: Module 3 routes small/large and Module 4 predicts the
+  budget and generates the answer, but there is no cache at all — every
+  stage, every pass, is a genuinely fresh call (this is what makes Test 2 a
+  real "no memory system" comparison, not a relabeled Module 1+2 run).
+- **TRUE ZERO MODULES**: a plain orchestrator pipeline hitting ONE common
+  LLM, every stage, every pass — none of the four modules involved. This is
+  the actual from-scratch starting point.
+- **FULL**: all four modules together, exactly as in the wiring check above.
+
+All four configurations use the same MockBackend text generation, so each
+comparison isolates a decision (routing, budgeting, or caching), not a
+difference in which backend answered. Module 3 made a genuine,
+non-degenerate split throughout (24 of 80 stage-calls routed small, 56
+large), confirming the savings come from real per-query routing decisions,
 not a constant one. As with the rest of this repo's MockBackend results, the
 token counts are real and reproducible but the *quality* of the generated
 text is not meaningfully evaluated — see Module 4's own real-Llama evaluation
@@ -81,7 +96,7 @@ text is not meaningfully evaluated — see Module 4's own real-Llama evaluation
 of the picture, and "Connecting real models" below to re-run this same
 comparison against a real backend.
 
-### Scaling to pool_size=1000 real benchmark queries
+### Scaling to pool_size=100 and pool_size=1000 real benchmark queries
 
 `--pool-size N` replays the first N real queries from `small_query_bank.py`
 (the same `pool_size` convention Module 1's own experiments use) instead of
@@ -90,22 +105,64 @@ capacity up with pool size is what previously pushed a related experiment in
 this project into severe system memory pressure:
 
 ```bash
+python3 unified_pipeline_experiment.py --pool-size 100
+```
+
+```
+MODULE 1+2 ONLY   (caching on,  routing/budgeting off): 216,200 tokens
+MODULE 3+4 ONLY   (caching off, routing/budgeting on) : 163,560 tokens
+TRUE ZERO MODULES (plain orchestrator, one common LLM): 216,200 tokens
+FULL (Module 1+2+3+4)                                 : 151,187 tokens
+
+TEST 1: MODULE 1+2 ONLY   -> FULL : 30.1% saved
+TEST 2: MODULE 3+4 ONLY   -> FULL :  7.6% saved
+TEST 3: TRUE ZERO MODULES -> FULL : 30.1% saved
+```
+
+A genuinely interesting result here: **MODULE 1+2 ONLY and TRUE ZERO MODULES
+land on the exact same token total (216,200), so Test 1 and Test 3 coincide
+(both 30.1%).** At this capacity (78 resident items) against 100 questions
+(400 items per pass), every item generated on pass 1 gets evicted all the
+way to DELETED before pass 2 — MODULE 1+2 ONLY's cache hit rate is 0.0%, so
+its caching contributes *nothing* on its own at this scale. The entire
+30.1% saving at pool_size=100 comes from Module 3+4's routing and
+budgeting, not from caching. Caching only starts contributing once routing
+is also active and the question set is small enough relative to capacity
+for the FULL configuration itself to get real hits (6.8% hit rate here,
+which is why Test 2 — MODULE 3+4 ONLY → FULL, isolating caching's
+*additional* contribution on top of routing — comes out to a modest 7.6%
+rather than 0%).
+
+```bash
 python3 unified_pipeline_experiment.py --pool-size 1000
 ```
 
 ```
-BASELINE (Module 1+2 only)                    FULL (Module 1+2+3+4)
-  total tokens: 2,162,000                       total tokens: 1,417,267
-                                                 routing decisions: small=4,624, large=3,376
-Token saving from Module 3 + Module 4 (on top of Module 1+2): 34.4%
+MODULE 1+2 ONLY   (caching on,  routing/budgeting off): 2,162,000 tokens
+MODULE 3+4 ONLY   (caching off, routing/budgeting on) : 1,432,464 tokens
+TRUE ZERO MODULES (plain orchestrator, one common LLM): 2,162,000 tokens
+FULL (Module 1+2+3+4)                                 : 1,417,267 tokens
+
+TEST 1: MODULE 1+2 ONLY   -> FULL : 34.4% saved
+TEST 2: MODULE 3+4 ONLY   -> FULL :  1.1% saved
+TEST 3: TRUE ZERO MODULES -> FULL : 34.4% saved
 ```
 
-The saving holds — and grows — at scale (17.8% at 10 questions, 30.1% at
-100, 34.4% at 1,000), with the routing split staying genuinely mixed rather
-than collapsing to one decision. At this pool size, fixed capacity starves
-hard (store hit rate 0.0% baseline / 1.1% full) — expected and consistent
-with this project's own capacity-vs-pool-size finding elsewhere, not a defect
-in this comparison.
+The pool_size=100 pattern holds exactly at pool_size=1000, only more so:
+MODULE 1+2 ONLY and TRUE ZERO MODULES land on the identical 2,162,000-token
+total again (hit rate 0.0% for MODULE 1+2 ONLY — the cache contributes
+nothing on its own at this scale), so Test 1 and Test 3 coincide (both
+34.4%). Test 2 — caching's *additional* contribution once routing is
+already active — shrinks even further than at pool_size=100 (7.6% → 1.1%),
+since FULL's own hit rate also drops with scale (6.8% at pool_size=100,
+1.1% at pool_size=1000): fixed capacity starves harder as the pool grows,
+exactly the capacity-vs-pool-size pattern this project already established
+for Module 1 in isolation, now shown to apply to caching's contribution
+*within* the combined pipeline too. Total wall-clock time for all four
+configurations: 726.9s + 677.0s + 0.3s + 878.2s ≈ 38 minutes (MODULE 3+4
+ONLY and TRUE ZERO MODULES are both much faster than their caching-enabled
+counterparts at this scale, since skipping the cache also skips Module 2's
+semantic directory's quadratic TF-IDF lookup cost entirely).
 
 **A real performance fix, not just a bigger run**: `module3.py`'s `route()`
 is memoized by exact query text. `hooks.select_model()` calls it with the
@@ -185,6 +242,20 @@ import pipeline
 result = pipeline.run_demo(questions, llm="module34",
                            module4_small=small, module4_large=large)
 ```
+
+**For `unified_pipeline_experiment.py` specifically** (the baseline-vs-full
+comparison script), the same swap is one flag — `--backend groq` uses
+Groq's free, OpenAI-compatible API instead of MockBackend, so Test 1/2/3's
+percentages come from real inference instead of synthetic filler text:
+
+```bash
+export GROQ_API_KEY=your_key_here   # free key: https://console.groq.com
+python3 unified_pipeline_experiment.py --backend groq --pool-size 20
+```
+
+Start with a small `--pool-size` (10-20) — real API calls are far slower
+than MockBackend's instant synthetic text, and Groq's free tier is
+rate-limited.
 
 **Read this before connecting real models — the three teammates tested
 against three different model pairs, and that was never reconciled:**

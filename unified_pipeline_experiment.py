@@ -3,26 +3,36 @@ unified_pipeline_experiment.py
 
 The actual "what do you get from combining all four modules" experiment --
 runs the IDENTICAL question set, through the IDENTICAL orchestration loop
-(pipeline.py), in two configurations that differ in only one respect:
+(pipeline.py), across FOUR configurations that turn Module 1+2 (caching/
+eviction) and Module 3+4 (routing/budgeting) on or off independently:
 
-    BASELINE (Module 1+2 only) : no Module 3 routing (every stage forced
-               to the "large" model), no Module 4 budgeting (every
-               generation uncapped, via the same backend's own normal/
-               full-length output). Module 1 + Module 2 (caching/eviction)
-               ARE active here too -- this is not a from-scratch,
-               no-memory-at-all baseline (that comparison already exists,
-               see Module 2's own README section). It isolates what
-               Module 3 + Module 4 add ON TOP of an already-working
-               Module 1+2 pipeline.
+    MODULE 1+2 ONLY   : caching/eviction ON, routing/budgeting OFF (every
+                        stage forced to the "large" model, uncapped
+                        generation).
+    MODULE 3+4 ONLY   : caching/eviction OFF (every stage is a genuinely
+                        fresh call, every pass -- nothing is ever served
+                        from a cache), routing/budgeting ON.
+    TRUE ZERO MODULES : caching/eviction OFF, routing/budgeting OFF -- a
+                        plain orchestrator pipeline hitting ONE common
+                        LLM, every stage, every pass. The actual
+                        from-scratch starting point with none of the
+                        four modules involved.
+    FULL (1+2+3+4)    : caching/eviction ON, routing/budgeting ON -- all
+                        four modules together.
 
-    FULL (Module 1+2+3+4) : all four modules together -- Module 1+2's
-               caching/eviction exactly as in the baseline, PLUS Module
-               3's real trained router deciding small/large per stage and
-               Module 4 predicting a token budget for that choice and
-               generating the answer with it (MockBackend text generation
-               in both configurations, so the comparison isolates the
-               routing+budgeting DECISION, not a difference in which
-               text-generation backend was used).
+Three comparisons are printed, each isolating a different question:
+    1. MODULE 1+2 ONLY   -> FULL   : what do Module 3+4 add on top of an
+                                     already-working Module 1+2 pipeline?
+    2. MODULE 3+4 ONLY   -> FULL   : what does Module 1+2's caching add on
+                                     top of an already-working Module 3+4
+                                     pipeline?
+    3. TRUE ZERO MODULES -> FULL   : what do all four modules together save
+                                     against the real from-scratch baseline?
+
+All four configurations use the SAME MockBackend text generation (so the
+comparisons isolate the routing+budgeting+caching DECISIONS, not a
+difference in which text-generation backend was used), and the SAME fixed
+capacity (not scaled with pool size -- see below).
 
 QUESTION SET: by default, the same 10-question small set as before. Pass
 `--pool-size N` to instead use the first N real benchmark queries from
@@ -111,25 +121,51 @@ def build_questions(pool_size):
     return list(SMALL_QUERY_BANK_FULL[:pool_size])
 
 
-def _baseline_call_llm(clients, provider, model, prompt, max_tokens=None):
-    """No Module 3 routing (model is always forced to 'large' by
-    baseline_select_model below), no Module 4 budgeting -- generates the
-    backend's own full, uncapped answer (module4.NORMAL_MAX ceiling,
-    i.e. effectively "as much as the backend has to say"), the same code
-    path module4.run()'s own safe-mode fallback uses internally."""
+def _uncapped_call_llm(clients, provider, model, prompt, max_tokens=None):
+    """No Module 4 budgeting -- generates the backend's own full, uncapped
+    answer (module4.NORMAL_MAX ceiling, i.e. effectively "as much as the
+    backend has to say"), the same code path module4.run()'s own safe-mode
+    fallback uses internally. Used by any configuration with
+    routing/budgeting OFF, regardless of whether caching is on."""
     backend, _note = module4._pick_backend(module4.normalize_choice(model))
     r = backend.generate(module4.build_system(None), prompt, module4.NORMAL_MAX)
     return dict(content=r["text"], input_tokens=0, output_tokens=r["tokens"],
-               cost=0.0, latency_s=0.0, provider=provider, model=f"baseline:{model}")
+               cost=0.0, latency_s=0.0, provider=provider, model=f"nobudget:{model}")
 
 
-def run_config(label, questions, use_routing_and_budgeting, passes=2,
-              capacities=None, progress_every=200):
-    module4.configure(
-        "module4_budget.joblib",
-        small=module4.MockBackend("small", SMALL_BACKEND_WORDS),
-        large=module4.MockBackend("large", LARGE_BACKEND_WORDS),
-    )
+def build_groq_backends(api_key, small_model="llama-3.1-8b-instant",
+                        large_model="llama-3.3-70b-versatile"):
+    """Real backends via Groq's free, OpenAI-compatible API -- swap in for
+    MockBackend to measure real inference instead of synthetic filler text.
+    Get a free key at https://console.groq.com (API Keys)."""
+    base = "https://api.groq.com/openai/v1"
+    return (module4.OpenAIChatBackend(small_model, base, api_key),
+           module4.OpenAIChatBackend(large_model, base, api_key))
+
+
+def run_config(label, questions, use_caching, use_routing_and_budgeting,
+              passes=2, capacities=None, progress_every=200, backends=None):
+    """Runs `questions` through the 4-stage pipeline `passes` times.
+
+    use_caching=True   -> Module 1 (eviction) + Module 2 (shared memory)
+                           active: a Module 2 hit is served from Module 1's
+                           store without a fresh LLM call.
+    use_caching=False  -> no Module 1, no Module 2: every single stage
+                           call, every pass, is a fresh LLM call. This is
+                           what makes "MODULE 3+4 ONLY" and "TRUE ZERO
+                           MODULES" genuinely have no memory system, not
+                           just a relabeled Module 1+2 run.
+
+    use_routing_and_budgeting=True  -> Module 3 (hooks.select_model) picks
+                           small/large per stage, Module 4 predicts the
+                           budget and generates the answer.
+    use_routing_and_budgeting=False -> every stage forced to "large",
+                           uncapped generation (_uncapped_call_llm) -- a
+                           single common LLM with no routing decision.
+    """
+    small, large = backends or (module4.MockBackend("small", SMALL_BACKEND_WORDS),
+                                module4.MockBackend("large", LARGE_BACKEND_WORDS))
+    module4.configure("module4_budget.joblib", small=small, large=large)
 
     if use_routing_and_budgeting:
         if not llm_backends.router_is_configured():
@@ -139,29 +175,19 @@ def run_config(label, questions, use_routing_and_budgeting, passes=2,
     else:
         def select_model(stage_name, question):
             return "module4", "large"
-        call_llm = _baseline_call_llm
+        call_llm = _uncapped_call_llm
 
-    directory = SemanticSharedMemoryDirectory()
     caps = capacities or pipeline_mod.DEFAULT_CAPACITIES
     routing_counts = {"small": 0, "large": 0}
 
-    with tempfile.TemporaryDirectory() as root:
-        path = Path(root)
-        store = RealCostAwareMemoryStore(
-            {"module4": None}, call_llm_fn=call_llm,
-            active_capacity=caps["active_capacity"],
-            vector_capacity=caps["vector_capacity"],
-            cold_capacity=caps["cold_capacity"],
-            active_backend=ActiveBackend(),
-            vector_backend=VectorBackend(path=str(path / "chroma"), persistent=False),
-            cold_backend=ColdBackend(db_path=str(path / "store.db")),
-            deleted_backend=DeletedBackend(db_path=str(path / "store.db")),
-        )
+    t = 0
+    wall0 = time.perf_counter()
+    per_pass = []
+    n_done = 0
+    total_tokens_nocache = 0  # only used when use_caching=False
 
-        t = 0
-        wall0 = time.perf_counter()
-        per_pass = []
-        n_done = 0
+    def run_loop(lookup_and_record):
+        nonlocal t, n_done, total_tokens_nocache
         for p in range(1, passes + 1):
             counts = dict(fresh=0, shared_cached=0, shared_evicted=0)
             for question in questions:
@@ -171,18 +197,8 @@ def run_config(label, questions, use_routing_and_budgeting, passes=2,
                     provider, model = select_model(stage_name, question)
                     if use_routing_and_budgeting:
                         routing_counts[model] += 1
-                    match = directory.lookup(stage_name, question)
-                    if match["hit"]:
-                        misses_before = store.misses
-                        item = store.access(match["item_id"], t)
-                        evicted = store.misses > misses_before
-                        counts["shared_evicted" if evicted else "shared_cached"] += 1
-                        content = item.content
-                    else:
-                        item = store.add(t, prompt, provider, model)
-                        directory.record(stage_name, question, item.id, f"q{question[:12]}")
-                        counts["fresh"] += 1
-                        content = item.content
+                    content = lookup_and_record(stage_name, question, prompt,
+                                                provider, model, t, counts)
                     context[context_key] = content
                     t += 1
                     n_done += 1
@@ -191,73 +207,148 @@ def run_config(label, questions, use_routing_and_budgeting, passes=2,
                         print(f"    [{label}] {n_done} stage-calls done, "
                               f"{elapsed:.0f}s elapsed", flush=True)
             per_pass.append(counts)
-        wall_elapsed = time.perf_counter() - wall0
 
-    store_stats = compute_row_stats(store)
+    if use_caching:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)
+            store = RealCostAwareMemoryStore(
+                {"module4": None}, call_llm_fn=call_llm,
+                active_capacity=caps["active_capacity"],
+                vector_capacity=caps["vector_capacity"],
+                cold_capacity=caps["cold_capacity"],
+                active_backend=ActiveBackend(),
+                vector_backend=VectorBackend(path=str(path / "chroma"), persistent=False),
+                cold_backend=ColdBackend(db_path=str(path / "store.db")),
+                deleted_backend=DeletedBackend(db_path=str(path / "store.db")),
+            )
+            directory = SemanticSharedMemoryDirectory()
+
+            def lookup_and_record(stage_name, question, prompt, provider, model, t, counts):
+                match = directory.lookup(stage_name, question)
+                if match["hit"]:
+                    misses_before = store.misses
+                    item = store.access(match["item_id"], t)
+                    evicted = store.misses > misses_before
+                    counts["shared_evicted" if evicted else "shared_cached"] += 1
+                else:
+                    item = store.add(t, prompt, provider, model)
+                    directory.record(stage_name, question, item.id, f"q{question[:12]}")
+                    counts["fresh"] += 1
+                return item.content
+
+            run_loop(lookup_and_record)
+            stats = compute_row_stats(store)
+            total_tokens, hit_rate = stats["total_tokens"], stats["hit_rate"]
+    else:
+        def lookup_and_record(stage_name, question, prompt, provider, model, t, counts):
+            nonlocal total_tokens_nocache
+            result = call_llm({}, provider, model, prompt)
+            total_tokens_nocache += result["input_tokens"] + result["output_tokens"]
+            counts["fresh"] += 1
+            return result["content"]
+
+        run_loop(lookup_and_record)
+        total_tokens = total_tokens_nocache
+        hit_rate = 0.0
+
+    wall_elapsed = time.perf_counter() - wall0
     total_requests = passes * len(questions) * len(PIPELINE_STAGES)
-    return dict(label=label, per_pass=per_pass, store_stats=store_stats,
-               wall_elapsed=wall_elapsed, total_requests=total_requests,
-               routing_counts=routing_counts, n_questions=len(questions))
+    return dict(label=label, per_pass=per_pass, total_tokens=total_tokens,
+               hit_rate=hit_rate, wall_elapsed=wall_elapsed,
+               total_requests=total_requests, routing_counts=routing_counts,
+               n_questions=len(questions))
+
+
+def print_config(result):
+    print("=" * 78)
+    print(result["label"])
+    print("=" * 78)
+    for p in result["per_pass"]:
+        print(f"  pass: fresh={p['fresh']}, shared_cached={p['shared_cached']}, "
+              f"shared_evicted={p['shared_evicted']}")
+    if result["routing_counts"]["small"] or result["routing_counts"]["large"]:
+        print(f"  routing decisions: small={result['routing_counts']['small']}, "
+              f"large={result['routing_counts']['large']}")
+    print(f"  total tokens: {result['total_tokens']:.0f}")
+    print(f"  hit rate: {result['hit_rate']:.1%}")
+    print(f"  wall time: {result['wall_elapsed']:.2f}s")
+    print()
+
+
+def print_comparison(title, from_result, to_result):
+    from_tokens = from_result["total_tokens"]
+    to_tokens = to_result["total_tokens"]
+    saved_pct = 100 * (from_tokens - to_tokens) / from_tokens if from_tokens else 0
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    print(f"  {from_result['label']}: {from_tokens:.0f} tokens")
+    print(f"  {to_result['label']}: {to_tokens:.0f} tokens")
+    print(f"  Token saving: {saved_pct:.1f}%")
+    print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Combined 4-module baseline-vs-full comparison")
+    parser = argparse.ArgumentParser(description="Combined 4-module comparison, 3 baselines")
     parser.add_argument("--pool-size", type=int, default=None,
                         help="Use the first N real benchmark queries from "
                              "small_query_bank instead of the default 10-question set.")
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--progress-every", type=int, default=200,
                         help="Print a progress line every N stage-calls (0 to disable).")
+    parser.add_argument("--backend", choices=["mock", "groq"], default="mock",
+                        help="'mock' = instant synthetic filler text (default). "
+                             "'groq' = real inference via Groq's free OpenAI-compatible "
+                             "API -- requires GROQ_API_KEY env var, get one free at "
+                             "https://console.groq.com.")
     args = parser.parse_args()
 
     questions = build_questions(args.pool_size)
     caps = pipeline_mod.DEFAULT_CAPACITIES  # fixed regardless of pool size, by design
 
+    backends = None
+    if args.backend == "groq":
+        import os
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise SystemExit("--backend groq requires the GROQ_API_KEY environment "
+                             "variable (free key: https://console.groq.com)")
+        backends = build_groq_backends(api_key)
+        print("Backend: Groq (real inference) -- small=llama-3.1-8b-instant, "
+              "large=llama-3.3-70b-versatile\n")
+
     print(f"Question set: {len(questions)} questions x {len(PIPELINE_STAGES)} "
           f"stages x {args.passes} passes = "
           f"{len(questions) * len(PIPELINE_STAGES) * args.passes} stage-requests")
-    print(f"Capacity (fixed): {caps}\n")
+    print(f"Capacity (fixed, only applies when caching is on): {caps}\n")
 
-    # Labels spell out what's actually active in each configuration --
-    # "BASELINE" is NOT "no modules", it's Module 1+2 alone (caching and
-    # eviction are on in both configurations; only routing/budgeting
-    # differ), and "FULL" is all four modules together, not just "3+4"
-    # added to nothing.
-    baseline = run_config("BASELINE (Module 1+2 only)", questions,
-                          use_routing_and_budgeting=False,
-                          passes=args.passes, capacities=caps,
-                          progress_every=args.progress_every)
-    full = run_config("FULL (Module 1+2+3+4)", questions,
-                      use_routing_and_budgeting=True,
-                      passes=args.passes, capacities=caps,
-                      progress_every=args.progress_every)
+    common_kwargs = dict(passes=args.passes, capacities=caps,
+                         progress_every=args.progress_every, backends=backends)
 
-    for result in (baseline, full):
-        s = result["store_stats"]
-        print("=" * 78)
-        print(result["label"])
-        print("=" * 78)
-        for p in result["per_pass"]:
-            print(f"  pass: fresh={p['fresh']}, shared_cached={p['shared_cached']}, "
-                  f"shared_evicted={p['shared_evicted']}")
-        if result["routing_counts"]["small"] or result["routing_counts"]["large"]:
-            print(f"  routing decisions: small={result['routing_counts']['small']}, "
-                  f"large={result['routing_counts']['large']}")
-        print(f"  total tokens: {s['total_tokens']:.0f}")
-        print(f"  store hit rate: {s['hit_rate']:.1%}")
-        print(f"  wall time: {result['wall_elapsed']:.2f}s")
-        print()
+    module12_only = run_config("MODULE 1+2 ONLY (caching on, routing/budgeting off)",
+                               questions, use_caching=True,
+                               use_routing_and_budgeting=False, **common_kwargs)
+    module34_only = run_config("MODULE 3+4 ONLY (caching off, routing/budgeting on)",
+                               questions, use_caching=False,
+                               use_routing_and_budgeting=True, **common_kwargs)
+    true_zero = run_config("TRUE ZERO MODULES (plain orchestrator, one common LLM)",
+                           questions, use_caching=False,
+                           use_routing_and_budgeting=False, **common_kwargs)
+    full = run_config("FULL (Module 1+2+3+4)", questions, use_caching=True,
+                      use_routing_and_budgeting=True, **common_kwargs)
 
-    base_tokens = baseline["store_stats"]["total_tokens"]
-    full_tokens = full["store_stats"]["total_tokens"]
-    saved_pct = 100 * (base_tokens - full_tokens) / base_tokens if base_tokens else 0
-    print("=" * 78)
-    print("COMBINED RESULT")
-    print("=" * 78)
-    print(f"  Questions: {len(questions)}, capacity: {caps}")
-    print(f"  Baseline tokens: {base_tokens:.0f}")
-    print(f"  Full (all 4 modules) tokens: {full_tokens:.0f}")
-    print(f"  Token saving from Module 3 + Module 4 (on top of Module 1+2): {saved_pct:.1f}%")
+    for result in (module12_only, module34_only, true_zero, full):
+        print_config(result)
+
+    print_comparison("TEST 1: MODULE 1+2 ONLY -> FULL "
+                     "(what Module 3+4 add on top of Module 1+2)",
+                     module12_only, full)
+    print_comparison("TEST 2: MODULE 3+4 ONLY -> FULL "
+                     "(what Module 1+2's caching adds on top of Module 3+4)",
+                     module34_only, full)
+    print_comparison("TEST 3: TRUE ZERO MODULES -> FULL "
+                     "(what all four modules together save vs. no modules at all)",
+                     true_zero, full)
 
 
 if __name__ == "__main__":

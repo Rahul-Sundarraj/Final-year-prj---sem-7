@@ -17,3 +17,6 @@ joblib
 # Only if you connect Module 4 to a real OpenAI-compatible API
 # (module4.OpenAIChatBackend)
 requests
+
+# demo_app.py's web UI
+flask
